@@ -17,7 +17,7 @@ use crate::error::SupabaseRealtimeError;
 use crate::message::access_token::AccessToken;
 use crate::message::phx_join::PostgrsChanges;
 use crate::message::presence_inner::PresenceInner;
-use crate::message::{ProtocolMessage, ProtocolPayload, broadcast, phx_join};
+use crate::message::{broadcast, phx_join, ProtocolMessage, ProtocolPayload};
 use crate::{connection, error, message};
 
 pub struct DbUpdates;
@@ -190,7 +190,7 @@ impl<T> RealtimeConnection<T> {
     #[tracing::instrument(skip_all, err)]
     pub async fn connect(
         self,
-        login_info: LoginCredentials,
+        access_token: impl Into<String>,
     ) -> Result<
         (
             impl Stream<Item = RealtimeStreamType>,
@@ -203,23 +203,7 @@ impl<T> RealtimeConnection<T> {
             format!("realtime/v1/websocket?apikey={supabase_annon_key}&vsn=1.0.0").as_str(),
         )?;
 
-        let mut auth_stream = rp_supabase_auth::jwt_stream::JwtStream::new(self.config.clone())
-            .sign_in(login_info)?;
-        let mut latest_access_token = loop {
-            match auth_stream.next().await {
-                Some(Ok(new_latest_access_token)) => {
-                    let Some(access_token) = new_latest_access_token.access_token else {
-                        tracing::error!("access token was not present!");
-                        continue;
-                    };
-                    break access_token;
-                }
-                Some(Err(err)) => {
-                    tracing::error!(?err, "initial jwt fetch err");
-                }
-                None => return Err(error::SupabaseRealtimeError::JwtStreamClosedUnexpectedly),
-            }
-        };
+        let mut latest_access_token = access_token.into();
 
         let mut ref_counter = 0_u64;
         let mut join_ref_counter = 0_u64;
@@ -255,48 +239,20 @@ impl<T> RealtimeConnection<T> {
         };
 
         let topic = self.topic.clone();
-        let access_token_stream = {
-            auth_stream
-                .filter_map(move |item| {
-                    let topic = topic.clone();
-                    async move {
-                        item.map(|item| {
-                            if let Some(access_token) = item.access_token {
-                                return Some(message::ProtocolMessage {
-                                    topic: topic.clone(),
-                                    payload: message::ProtocolPayload::AccessToken(AccessToken {
-                                        access_token,
-                                    }),
-                                    ref_field: None,
-                                    join_ref: None,
-                                });
-                            }
-                            None
-                        })
-                        .map_err(SupabaseRealtimeError::from)
-                        .transpose()
-                    }
-                })
-                .boxed()
-        };
-        let input_stream =
-            futures::stream::select_all([input_stream, heartbeat_stream, access_token_stream])
-                .map(move |mut item| {
-                    if let Ok(item) = &mut item {
-                        if let message::ProtocolPayload::AccessToken(at) = &mut item.payload {
-                            latest_access_token = at.access_token.clone();
-                        }
-                        item.set_access_token(&latest_access_token);
-                    }
-                    item
-                })
-                .map(move |mut item| {
-                    ref_counter = ref_counter.saturating_add(1);
-                    if let Ok(item) = &mut item {
-                        item.ref_field = Some(ref_counter.to_string());
-                    }
-                    item
-                });
+        let input_stream = futures::stream::select_all([input_stream, heartbeat_stream])
+            .map(move |mut item| {
+                if let Ok(item) = &mut item {
+                    item.set_access_token(&latest_access_token);
+                }
+                item
+            })
+            .map(move |mut item| {
+                ref_counter = ref_counter.saturating_add(1);
+                if let Ok(item) = &mut item {
+                    item.ref_field = Some(ref_counter.to_string());
+                }
+                item
+            });
 
         let client = RealtimeConnectionClient {
             tx,
@@ -325,7 +281,7 @@ impl RealtimeConnection<Presence> {
     #[tracing::instrument(skip_all, err)]
     pub async fn connect_with_state_tracking<T: DeserializeOwned>(
         self,
-        login_info: LoginCredentials,
+        access_token: impl Into<String>,
     ) -> Result<
         (
             impl Stream<
@@ -335,7 +291,7 @@ impl RealtimeConnection<Presence> {
         ),
         SupabaseRealtimeError,
     > {
-        let (stream, realtime_client) = self.connect(login_info).await?;
+        let (stream, realtime_client) = self.connect(access_token).await?;
 
         let mut current_state = std::collections::HashMap::new();
 
